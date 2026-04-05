@@ -2,14 +2,13 @@
 //
 // Extracts the SQLCipher encryption key from a running WeChat process on macOS.
 //
-// Strategy:
+// Strategy (WeChat 4.x / WCDB):
 //   1. Read the first page of the encrypted .db file (contains salt + HMAC).
-//   2. Scan the WeChat process's heap memory for the "rtree_i32" marker string.
-//      This string comes from SQLite's R-Tree extension registration. In WeChat's
-//      memory layout, the SQLCipher key happens to be stored 24 bytes after one
-//      of the occurrences of this marker in the nano-malloc heap region.
-//   3. There may be multiple "rtree_i32" occurrences in memory. For each one,
-//      treat the 32 bytes at offset +24 as a candidate key and validate it by
+//   2. Scan the WeChat process's heap memory for WCDB keyspec strings.
+//      WCDB stores the key in memory as a 99-byte ASCII string:
+//        x'<64 hex chars (32-byte key)><32 hex chars (16-byte salt)>'
+//      See WCDB AbstractHandle.cpp: WCTAssert(rawCipherSize == 99)
+//   3. For each keyspec found, decode the 32-byte key and validate it by
 //      recomputing the HMAC of the first database page. If the HMAC matches,
 //      we found the correct key.
 //
@@ -33,29 +32,26 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <stdio.h>
+#include <string.h>
 
-// SQLCipher database constants (default settings used by WeChat).
+// SQLCipher database constants (default settings used by WeChat 4.x / WCDB).
 // Key/IV/HMAC sizes come from the crypto provider at runtime in SQLCipher;
 // these are the defaults for AES-256-CBC + HMAC-SHA1.
-// WeChat overrides the page size to 1024 (SQLCipher default is 4096).
+// WeChat 4.x uses WCDB with 4096-byte pages (SQLCipher default is also 4096).
 // See: https://github.com/sqlcipher/sqlcipher/blob/778ab890cfc30c3631212dcceb0295498abdcd3e/src/sqlcipher.c#L145
-#define DB_PAGE_SIZE 1024
+#define DB_PAGE_SIZE 4096
 #define SQLCIPHER_KEY_SIZE 32
 #define SALT_SIZE 16
 #define HMAC_SHA1_SIZE 20
 #define IV_SIZE 16
 #define AES_BLOCK_SIZE 16
 
-// In WeChat's heap, the SQLCipher key is located 24 bytes after the
-// "rtree_i32" marker string within the same allocation.
-#define KEY_OFFSET_FROM_MARKER 24
-
-// The "rtree_i32" string that SQLite registers for its R-Tree extension.
-// Used as an anchor to locate the nearby encryption key in heap memory.
-static const unsigned char RTREE_MARKER[] = {
-    0x72, 0x74, 0x72, 0x65, 0x65, 0x5F, 0x69, 0x33, 0x32 // "rtree_i32"
-};
-#define RTREE_MARKER_SIZE sizeof(RTREE_MARKER)
+// WCDB keyspec format: x'<64 hex key chars><32 hex salt chars>'
+// Total length: 2 + 64 + 32 + 1 = 99 bytes.
+// See: https://github.com/Tencent/wcdb — AbstractHandle.cpp: WCTAssert(rawCipherSize == 99)
+#define KEY_HEX_LEN  (SQLCIPHER_KEY_SIZE * 2) // 64
+#define SALT_HEX_LEN (SALT_SIZE * 2)          // 32
+#define KEYSPEC_LEN  (2 + KEY_HEX_LEN + SALT_HEX_LEN + 1) // 99
 
 // Validates a candidate SQLCipher key against the first page of the database.
 //
@@ -110,8 +106,36 @@ bool validate_sqlcipher_key(const unsigned char *db_first_page,
   CCHmacFinal(&hmac_ctx, computed_hmac);
 
   // If the computed HMAC matches the stored one, the candidate key is correct
-  return memcmp(computed_hmac, db_first_page + hmac_offset, HMAC_SHA1_SIZE) ==
-         0;
+  return memcmp(computed_hmac, db_first_page + hmac_offset, HMAC_SHA1_SIZE) == 0;
+}
+
+// Parse a hex nibble. Returns -1 if not a valid hex char.
+static int hexval(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+// Check if buf points to a valid WCDB keyspec: x'<96 hex chars>'
+// If valid, decode the 32-byte key into out_key.
+static bool parse_keyspec(const unsigned char *buf, unsigned char *out_key) {
+  if (buf[0] != 'x' || buf[1] != '\'')
+    return false;
+  for (int i = 0; i < KEY_HEX_LEN + SALT_HEX_LEN; i++) {
+    if (hexval(buf[2 + i]) < 0)
+      return false;
+  }
+  if (buf[2 + KEY_HEX_LEN + SALT_HEX_LEN] != '\'')
+    return false;
+
+  // Decode the first 64 hex chars (32-byte key)
+  for (int i = 0; i < SQLCIPHER_KEY_SIZE; i++) {
+    int hi = hexval(buf[2 + i * 2]);
+    int lo = hexval(buf[2 + i * 2 + 1]);
+    out_key[i] = (unsigned char)((hi << 4) | lo);
+  }
+  return true;
 }
 
 // Scans a running WeChat process's memory to find the SQLCipher encryption key.
@@ -141,6 +165,9 @@ int extract_key_from_process(pid_t wechat_pid, const char *db_path,
   }
   fclose(fp);
 
+  // Prefix to search for: x' (start of WCDB keyspec)
+  static const unsigned char KEYSPEC_PREFIX[] = {'x', '\''};
+
   // Enumerate all memory regions in the target process
   mach_vm_address_t region_addr = 0;
   mach_vm_size_t region_size;
@@ -155,11 +182,10 @@ int extract_key_from_process(pid_t wechat_pid, const char *db_path,
     if (kr != KERN_SUCCESS)
       break;
 
-    // Only scan RW regions tagged as nano-malloc heap.
-    // WeChat's SQLCipher key resides in this type of allocation.
+    // Scan all readable+writable regions. WCDB's SQLCipher allocator wraps
+    // the system malloc, so keyspec strings may appear in any RW heap region.
     if ((region_info.protection & VM_PROT_READ) &&
-        (region_info.protection & VM_PROT_WRITE) &&
-        (region_info.user_tag == VM_MEMORY_MALLOC_NANO)) {
+        (region_info.protection & VM_PROT_WRITE)) {
 
       unsigned char *region_data = malloc(region_size);
 
@@ -168,26 +194,26 @@ int extract_key_from_process(pid_t wechat_pid, const char *db_path,
                                   (mach_vm_address_t)region_data, &bytes_read);
       if (kr != KERN_SUCCESS) {
         free(region_data);
-        break;
+        region_addr += region_size;
+        continue;
       }
 
-      // Scan this region for all occurrences of the "rtree_i32" marker
+      // Scan this region for all occurrences of the keyspec prefix "x'"
       unsigned char *scan_pos = region_data;
       unsigned char *region_end = region_data + bytes_read;
-      while ((scan_pos = memmem(scan_pos, region_end - scan_pos, RTREE_MARKER,
-                                RTREE_MARKER_SIZE))) {
-        unsigned char *candidate_key = scan_pos + KEY_OFFSET_FROM_MARKER;
-        if (candidate_key + SQLCIPHER_KEY_SIZE > region_end)
-          break;
-
-        // Validate this candidate key against the database's first page HMAC
-        if (validate_sqlcipher_key(db_first_page, candidate_key)) {
-          for (int i = 0; i < SQLCIPHER_KEY_SIZE; i++)
-            sprintf(out_key_hex + i * 2, "%02x", candidate_key[i]);
-          free(region_data);
-          return 0;
+      while ((scan_pos = memmem(scan_pos, region_end - scan_pos,
+                                KEYSPEC_PREFIX, sizeof(KEYSPEC_PREFIX)))) {
+        if (scan_pos + KEYSPEC_LEN <= region_end) {
+          unsigned char candidate_key[SQLCIPHER_KEY_SIZE];
+          // Validate this candidate key against the database's first page HMAC
+          if (parse_keyspec(scan_pos, candidate_key) &&
+              validate_sqlcipher_key(db_first_page, candidate_key)) {
+            for (int i = 0; i < SQLCIPHER_KEY_SIZE; i++)
+              sprintf(out_key_hex + i * 2, "%02x", candidate_key[i]);
+            free(region_data);
+            return 0;
+          }
         }
-
         scan_pos++;
       }
       free(region_data);
