@@ -8,43 +8,23 @@
 //      WCDB stores the key in memory as a 99-byte ASCII string:
 //        x'<64 hex chars (32-byte key)><32 hex chars (16-byte salt)>'
 //      See WCDB AbstractHandle.cpp: WCTAssert(rawCipherSize == 99)
-//   3. For each keyspec found, decode the 32-byte key and validate it by
-//      recomputing the HMAC of the first database page. If the HMAC matches,
-//      we found the correct key.
-//
-// Background — what is HMAC?
-//   HMAC (Hash-based Message Authentication Code) is a mechanism to verify both
-//   the integrity and authenticity of data. It combines a secret key with a hash
-//   function (here SHA-1) to produce a fixed-size tag. Only someone who knows
-//   the key can produce or verify the tag. Unlike a plain hash (which anyone can
-//   recompute), an HMAC proves the data hasn't been tampered with AND that it
-//   was produced by someone holding the correct key.
-//
-//   SQLCipher uses HMAC to protect each database page: after encrypting a page,
-//   it computes HMAC-SHA1(hmac_key, page_content || page_number) and stores the
-//   result in the page's reserved area. On read, it recomputes the HMAC and
-//   compares — if they differ, the page was corrupted or the wrong key was used.
-//   We exploit this: given a candidate key, we derive the HMAC key, recompute
-//   the HMAC for page 1, and check if it matches. A match means we found the
-//   correct encryption key.
+//   3. For each keyspec found, decode the embedded salt (last 16 bytes of the
+//      keyspec) and compare it against the first 16 bytes of the db file.
+//      SQLCipher writes the salt at the very start of the database file, and
+//      WCDB stores the same salt inside the keyspec — so a salt match uniquely
+//      identifies the correct keyspec for a given db file. No HMAC needed.
+//      (This mirrors the Python reference: find_key.py → salt_to_dbs.get(salt))
 
-#include <CommonCrypto/CommonCrypto.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-// SQLCipher database constants (default settings used by WeChat 4.x / WCDB).
-// Key/IV/HMAC sizes come from the crypto provider at runtime in SQLCipher;
-// these are the defaults for AES-256-CBC + HMAC-SHA1.
-// WeChat 4.x uses WCDB with 4096-byte pages (SQLCipher default is also 4096).
-// See: https://github.com/sqlcipher/sqlcipher/blob/778ab890cfc30c3631212dcceb0295498abdcd3e/src/sqlcipher.c#L145
-#define DB_PAGE_SIZE 4096
+// SQLCipher/WCDB constants for WeChat 4.x.
+// WeChat 4.x uses WCDB with 4096-byte pages.
 #define SQLCIPHER_KEY_SIZE 32
 #define SALT_SIZE 16
-#define HMAC_SHA1_SIZE 20
-#define IV_SIZE 16
-#define AES_BLOCK_SIZE 16
 
 // WCDB keyspec format: x'<64 hex key chars><32 hex salt chars>'
 // Total length: 2 + 64 + 32 + 1 = 99 bytes.
@@ -52,62 +32,6 @@
 #define KEY_HEX_LEN  (SQLCIPHER_KEY_SIZE * 2) // 64
 #define SALT_HEX_LEN (SALT_SIZE * 2)          // 32
 #define KEYSPEC_LEN  (2 + KEY_HEX_LEN + SALT_HEX_LEN + 1) // 99
-
-// Validates a candidate SQLCipher key against the first page of the database.
-//
-// SQLCipher stores an HMAC-SHA1 in each page's reserved area. This function
-// derives the HMAC key from the candidate key + salt (from the page header),
-// computes the HMAC over the page body, and checks if it matches the stored HMAC.
-//
-// Returns true if the candidate key is correct.
-bool validate_sqlcipher_key(const unsigned char *db_first_page,
-                            const unsigned char *candidate_key) {
-  if (!db_first_page || !candidate_key)
-    return false;
-
-  // Derive the HMAC salt by XOR-ing the encryption salt with HMAC_SALT_MASK (0x3A).
-  // This is an arbitrary constant defined in SQLCipher to produce a distinct salt
-  // for HMAC without storing a second salt in the page header.
-  // See: https://github.com/sqlcipher/sqlcipher/blob/778ab890cfc30c3631212dcceb0295498abdcd3e/src/sqlcipher.c#L144
-  unsigned char hmac_salt[SALT_SIZE];
-  for (int i = 0; i < SALT_SIZE; i++)
-    hmac_salt[i] = db_first_page[i] ^ 0x3A;
-
-  // Derive the HMAC key using PBKDF2-HMAC-SHA1 with 2 iterations.
-  // SQLCipher uses FAST_PBKDF2_ITER (default 2) for deriving the HMAC key,
-  // as opposed to the much slower full KDF iterations used for the encryption key.
-  // See: https://github.com/sqlcipher/sqlcipher/blob/778ab890cfc30c3631212dcceb0295498abdcd3e/src/sqlcipher.c#L180
-  // Used at: https://github.com/sqlcipher/sqlcipher/blob/778ab890cfc30c3631212dcceb0295498abdcd3e/src/sqlcipher.c#L3217
-  unsigned char hmac_key[SQLCIPHER_KEY_SIZE];
-  CCKeyDerivationPBKDF(kCCPBKDF2, (const char *)candidate_key,
-                       SQLCIPHER_KEY_SIZE, hmac_salt, SALT_SIZE,
-                       kCCPRFHmacAlgSHA1, 2, hmac_key, SQLCIPHER_KEY_SIZE);
-
-  // Calculate where the HMAC is stored in the page.
-  // The reserved area at the end of each page holds: IV + HMAC, rounded up
-  // to an AES block boundary. The HMAC starts right after the IV.
-  // See: https://github.com/sqlcipher/sqlcipher/blob/778ab890cfc30c3631212dcceb0295498abdcd3e/src/sqlcipher.c#L1642
-  int reserved_size =
-      ((IV_SIZE + HMAC_SHA1_SIZE + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE) *
-      AES_BLOCK_SIZE;
-  int hmac_offset = DB_PAGE_SIZE - reserved_size + IV_SIZE;
-
-  // Compute HMAC-SHA1 over the page content (after the salt, up to the HMAC)
-  CCHmacContext hmac_ctx;
-  CCHmacInit(&hmac_ctx, kCCHmacAlgSHA1, hmac_key, SQLCIPHER_KEY_SIZE);
-  CCHmacUpdate(&hmac_ctx, db_first_page + SALT_SIZE, hmac_offset - SALT_SIZE);
-
-  // SQLCipher includes the 1-based page number in the HMAC (little-endian).
-  // See sqlcipher_page_hmac(): https://github.com/sqlcipher/sqlcipher/blob/778ab890cfc30c3631212dcceb0295498abdcd3e/src/sqlcipher.c#L2836
-  unsigned char page_number_le[4] = {1, 0, 0, 0};
-  CCHmacUpdate(&hmac_ctx, page_number_le, 4);
-
-  unsigned char computed_hmac[HMAC_SHA1_SIZE];
-  CCHmacFinal(&hmac_ctx, computed_hmac);
-
-  // If the computed HMAC matches the stored one, the candidate key is correct
-  return memcmp(computed_hmac, db_first_page + hmac_offset, HMAC_SHA1_SIZE) == 0;
-}
 
 // Parse a hex nibble. Returns -1 if not a valid hex char.
 static int hexval(char c) {
@@ -118,8 +42,9 @@ static int hexval(char c) {
 }
 
 // Check if buf points to a valid WCDB keyspec: x'<96 hex chars>'
-// If valid, decode the 32-byte key into out_key.
-static bool parse_keyspec(const unsigned char *buf, unsigned char *out_key) {
+// If valid, decode the 32-byte key into out_key and 16-byte salt into out_salt.
+static bool parse_keyspec(const unsigned char *buf,
+                          unsigned char *out_key, unsigned char *out_salt) {
   if (buf[0] != 'x' || buf[1] != '\'')
     return false;
   for (int i = 0; i < KEY_HEX_LEN + SALT_HEX_LEN; i++) {
@@ -134,6 +59,12 @@ static bool parse_keyspec(const unsigned char *buf, unsigned char *out_key) {
     int hi = hexval(buf[2 + i * 2]);
     int lo = hexval(buf[2 + i * 2 + 1]);
     out_key[i] = (unsigned char)((hi << 4) | lo);
+  }
+  // Decode the last 32 hex chars (16-byte salt)
+  for (int i = 0; i < SALT_SIZE; i++) {
+    int hi = hexval(buf[2 + KEY_HEX_LEN + i * 2]);
+    int lo = hexval(buf[2 + KEY_HEX_LEN + i * 2 + 1]);
+    out_salt[i] = (unsigned char)((hi << 4) | lo);
   }
   return true;
 }
@@ -154,10 +85,14 @@ int extract_key_from_process(pid_t wechat_pid, const char *db_path,
     return -1;
   }
 
-  // Read the first page of the encrypted database for HMAC validation
-  unsigned char db_first_page[DB_PAGE_SIZE];
+  // Read the first 16 bytes (salt) of the db file.
+  // SQLCipher stores a random salt at the start of the first page.
+  // The WCDB keyspec also contains this same salt, so we match them to identify
+  // which keyspec in memory belongs to this db file — no HMAC needed.
+  // This mirrors the Python approach: salt_to_dbs.get(salt, [])
+  unsigned char db_salt[SALT_SIZE];
   FILE *fp = fopen(db_path, "rb");
-  if (!fp || fread(db_first_page, 1, DB_PAGE_SIZE, fp) != DB_PAGE_SIZE) {
+  if (!fp || fread(db_salt, 1, SALT_SIZE, fp) != SALT_SIZE) {
     fprintf(stderr, "failed to read db file\n");
     if (fp)
       fclose(fp);
@@ -205,9 +140,12 @@ int extract_key_from_process(pid_t wechat_pid, const char *db_path,
                                 KEYSPEC_PREFIX, sizeof(KEYSPEC_PREFIX)))) {
         if (scan_pos + KEYSPEC_LEN <= region_end) {
           unsigned char candidate_key[SQLCIPHER_KEY_SIZE];
-          // Validate this candidate key against the database's first page HMAC
-          if (parse_keyspec(scan_pos, candidate_key) &&
-              validate_sqlcipher_key(db_first_page, candidate_key)) {
+          unsigned char candidate_salt[SALT_SIZE];
+          // Match keyspec to db file by comparing the embedded salt against
+          // the first 16 bytes of the db file — same strategy as the Python
+          // reference implementation (find_key.py: salt_to_dbs.get(salt))
+          if (parse_keyspec(scan_pos, candidate_key, candidate_salt) &&
+              memcmp(candidate_salt, db_salt, SALT_SIZE) == 0) {
             for (int i = 0; i < SQLCIPHER_KEY_SIZE; i++)
               sprintf(out_key_hex + i * 2, "%02x", candidate_key[i]);
             free(region_data);
