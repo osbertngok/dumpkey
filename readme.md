@@ -12,15 +12,55 @@ clang poc.c -o dumpkey -O3 -flto
 
 ### AppStore WeChat Version 4.1.x
 
-WeChat 4.x uses WCDB with 4096-byte pages. The database files moved to a new location.
+WeChat 4.x uses [WCDB](https://github.com/Tencent/wcdb) (Tencent's SQLCipher fork). Each `.db` file uses a **different key**, so `dumpkey` now accepts a folder and outputs a JSON mapping of every db file to its key in one pass.
+
+**Step 1 — Extract all keys**
 
 ```shell
-# dumpkey <pid> <dbfile>
+# dumpkey <pid> <db_folder>
+sudo ./dumpkey $(pgrep WeChat | head -1) \
+  ~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/[account_id]/db_storage/
+```
 
-# example:
-sudo ./dumpkey $(pgrep WeChat | head -1) ~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/[account_id]/db_storage/message_0.db
+Output (JSON to stdout, progress to stderr):
 
-key: 8390b***********************ac9e299a00076
+```
+Found 12 .db file(s). Scanning WeChat process memory...
+Matched 12/12 key(s).
+```
+```json
+{
+  "message_0.db": "8390b...",
+  "message_1.db": "a1b2c...",
+  "contact.db":   "f00d1..."
+}
+```
+
+**Step 2 — Decrypt each database**
+
+Use the key for each file with any SQLCipher-compatible tool, e.g. the `sqlcipher` CLI:
+
+```shell
+sqlcipher message_0.db
+sqlite> PRAGMA key = "x'<key>'";
+sqlite> ATTACH DATABASE 'message_0_decrypted.db' AS plaintext KEY '';
+sqlite> SELECT sqlcipher_export('plaintext');
+sqlite> DETACH DATABASE plaintext;
+```
+
+**Step 3 — Decompress WCDB columns**
+
+The decrypted database still has `message_content` and `source` columns compressed with zstd (`WCDB_CT_* = 4`). Use `inflate_db.py` to produce a fully readable SQLite database:
+
+```shell
+pip install zstandard
+python3 inflate_db.py message_0_decrypted.db message_0_inflated.db
+```
+
+After this step, `message_content` contains plain XML:
+
+```xml
+<msg><appmsg ...><title>...</title><des>...</des><url>...</url></appmsg></msg>
 ```
 
 ## 2025-06-23 复活，最近有需求了，顺便更新一下
