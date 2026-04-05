@@ -1,5 +1,20 @@
 # Apple M1 Wechat DumpKey
 
+## 2026-04-05 WeChat 4.x support
+
+### AppStore WeChat Version 4.1.x
+
+WeChat 4.x uses WCDB with 4096-byte pages. The database files moved to a new location.
+
+```shell
+# dumpkey <pid> <dbfile>
+
+# example:
+sudo ./dumpkey $(pgrep WeChat | head -1) ~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/[account_id]/db_storage/message_0.db
+
+key: 8390b***********************ac9e299a00076
+```
+
 ## 2025-06-23 复活，最近有需求了，顺便更新一下
 
 ### AppStore WeChat Version. 3.8.10 (28633)
