@@ -2,6 +2,8 @@
 
 ## 2026-04-05 WeChat 4.x support
 
+WeChat 4.x key extraction strategy is based on [wechat-db-decrypt-macos](https://github.com/Thearas/wechat-db-decrypt-macos).
+
 ### Build
 
 Requires Xcode Command Line Tools (`xcode-select --install`). No other dependencies — uses only macOS system frameworks.
