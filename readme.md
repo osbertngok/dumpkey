@@ -14,7 +14,11 @@ clang poc.c -o dumpkey -O3 -flto
 
 ### AppStore WeChat Version 4.1.x
 
-WeChat 4.x uses WCDB with 4096-byte pages. The database files moved to a new location.
+WeChat 4.x uses [WCDB](https://github.com/Tencent/wcdb) (Tencent's SQLCipher fork). The key extraction strategy differs from WeChat 3.x:
+
+- **Key format**: WCDB stores the encryption key in process memory as a 99-byte keyspec string: `x'<64 hex chars key><32 hex chars salt>'`
+- **Matching**: The keyspec embeds the database salt, which is also the first 16 bytes of the db file. We scan process memory for valid keyspecs and match by salt — no HMAC computation needed.
+- **db path**: moved to `xwechat_files/[account_id]/db_storage/`
 
 ```shell
 # dumpkey <pid> <dbfile>
