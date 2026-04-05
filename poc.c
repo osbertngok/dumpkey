@@ -34,7 +34,11 @@
 #include <mach/mach_vm.h>
 #include <stdio.h>
 
-// SQLCipher database constants (default settings used by WeChat)
+// SQLCipher database constants (default settings used by WeChat).
+// Key/IV/HMAC sizes come from the crypto provider at runtime in SQLCipher;
+// these are the defaults for AES-256-CBC + HMAC-SHA1.
+// WeChat overrides the page size to 1024 (SQLCipher default is 4096).
+// See: https://github.com/sqlcipher/sqlcipher/blob/778ab890cfc30c3631212dcceb0295498abdcd3e/src/sqlcipher.c#L145
 #define DB_PAGE_SIZE 1024
 #define SQLCIPHER_KEY_SIZE 32
 #define SALT_SIZE 16
@@ -73,8 +77,11 @@ bool validate_sqlcipher_key(const unsigned char *db_first_page,
   for (int i = 0; i < SALT_SIZE; i++)
     hmac_salt[i] = db_first_page[i] ^ 0x3A;
 
-  // Derive the HMAC key using PBKDF2-HMAC-SHA1 with 2 iterations
-  // (SQLCipher uses fast_kdf_iter=2 for the HMAC key derivation)
+  // Derive the HMAC key using PBKDF2-HMAC-SHA1 with 2 iterations.
+  // SQLCipher uses FAST_PBKDF2_ITER (default 2) for deriving the HMAC key,
+  // as opposed to the much slower full KDF iterations used for the encryption key.
+  // See: https://github.com/sqlcipher/sqlcipher/blob/778ab890cfc30c3631212dcceb0295498abdcd3e/src/sqlcipher.c#L180
+  // Used at: https://github.com/sqlcipher/sqlcipher/blob/778ab890cfc30c3631212dcceb0295498abdcd3e/src/sqlcipher.c#L3217
   unsigned char hmac_key[SQLCIPHER_KEY_SIZE];
   CCKeyDerivationPBKDF(kCCPBKDF2, (const char *)candidate_key,
                        SQLCIPHER_KEY_SIZE, hmac_salt, SALT_SIZE,
@@ -83,6 +90,7 @@ bool validate_sqlcipher_key(const unsigned char *db_first_page,
   // Calculate where the HMAC is stored in the page.
   // The reserved area at the end of each page holds: IV + HMAC, rounded up
   // to an AES block boundary. The HMAC starts right after the IV.
+  // See: https://github.com/sqlcipher/sqlcipher/blob/778ab890cfc30c3631212dcceb0295498abdcd3e/src/sqlcipher.c#L1642
   int reserved_size =
       ((IV_SIZE + HMAC_SHA1_SIZE + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE) *
       AES_BLOCK_SIZE;
@@ -93,7 +101,8 @@ bool validate_sqlcipher_key(const unsigned char *db_first_page,
   CCHmacInit(&hmac_ctx, kCCHmacAlgSHA1, hmac_key, SQLCIPHER_KEY_SIZE);
   CCHmacUpdate(&hmac_ctx, db_first_page + SALT_SIZE, hmac_offset - SALT_SIZE);
 
-  // SQLCipher includes the 1-based page number in the HMAC (little-endian)
+  // SQLCipher includes the 1-based page number in the HMAC (little-endian).
+  // See sqlcipher_page_hmac(): https://github.com/sqlcipher/sqlcipher/blob/778ab890cfc30c3631212dcceb0295498abdcd3e/src/sqlcipher.c#L2836
   unsigned char page_number_le[4] = {1, 0, 0, 0};
   CCHmacUpdate(&hmac_ctx, page_number_le, 4);
 
