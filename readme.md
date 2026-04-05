@@ -2,6 +2,14 @@
 
 ## 2026-04-05 WeChat 4.x support
 
+### Build
+
+Requires Xcode Command Line Tools (`xcode-select --install`). No other dependencies — uses only macOS system frameworks.
+
+```shell
+clang poc.c -o dumpkey -O3 -flto
+```
+
 ### AppStore WeChat Version 4.1.x
 
 WeChat 4.x uses WCDB with 4096-byte pages. The database files moved to a new location.
