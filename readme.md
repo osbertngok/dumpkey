@@ -18,6 +18,8 @@ WeChat 4.x uses [WCDB](https://github.com/Tencent/wcdb) (Tencent's SQLCipher for
 
 ```shell
 # dumpkey <pid> <db_folder>
+# db files are nested under db_storage (e.g. db_storage/message/message_0.db)
+# pass db_storage/ as the folder — dumpkey scans recursively
 sudo ./dumpkey $(pgrep WeChat | head -1) \
   ~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/[account_id]/db_storage/
 ```
@@ -30,9 +32,9 @@ Matched 12/12 key(s).
 ```
 ```json
 {
-  "message_0.db": "8390b...",
-  "message_1.db": "a1b2c...",
-  "contact.db":   "f00d1..."
+  "message/message_0.db": "8390b...",
+  "message/message_1.db": "a1b2c...",
+  "contact/contact.db":   "f00d1..."
 }
 ```
 
