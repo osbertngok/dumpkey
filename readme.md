@@ -4,7 +4,9 @@
 
 WeChat 4.x key extraction strategy is based on [wechat-db-decrypt-macos](https://github.com/Thearas/wechat-db-decrypt-macos).
 
-### Build
+### Step 1 — Extract the encryption key
+
+Build and run `dumpkey` to extract the SQLCipher key from the running WeChat process.
 
 Requires Xcode Command Line Tools (`xcode-select --install`). No other dependencies — uses only macOS system frameworks.
 
@@ -27,6 +29,33 @@ WeChat 4.x uses [WCDB](https://github.com/Tencent/wcdb) (Tencent's SQLCipher for
 sudo ./dumpkey $(pgrep WeChat | head -1) ~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/[account_id]/db_storage/message_0.db
 
 key: 8390b***********************ac9e299a00076
+```
+
+### Step 2 — Decrypt the database
+
+Use the key from step 1 to decrypt the `.db` file with any SQLCipher-compatible tool, e.g. [DB Browser for SQLite (SQLCipher build)](https://sqlitebrowser.org) or the `sqlcipher` CLI:
+
+```shell
+sqlcipher message_0.db
+sqlite> PRAGMA key = "x'<key>'";
+sqlite> ATTACH DATABASE 'message_0_decrypted.db' AS plaintext KEY '';
+sqlite> SELECT sqlcipher_export('plaintext');
+sqlite> DETACH DATABASE plaintext;
+```
+
+### Step 3 — Decompress WCDB columns
+
+The decrypted database still has `message_content` and `source` columns compressed with zstd (WCDB's built-in column compression, `WCDB_CT_* = 4`). Use `inflate_db.py` to produce a fully readable SQLite database:
+
+```shell
+pip install zstandard
+python3 inflate_db.py message_0_decrypted.db message_0_inflated.db
+```
+
+After this step, `message_content` contains plain XML like:
+
+```xml
+<msg><appmsg ...><title>...</title><des>...</des><url>...</url></appmsg></msg>
 ```
 
 ## 2025-06-23 复活，最近有需求了，顺便更新一下
