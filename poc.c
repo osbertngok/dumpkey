@@ -65,8 +65,10 @@ bool validate_sqlcipher_key(const unsigned char *db_first_page,
   if (!db_first_page || !candidate_key)
     return false;
 
-  // Derive the HMAC salt by XOR-ing the database salt with 0x3A
-  // (SQLCipher convention: hmac_salt = encryption_salt XOR 0x3A)
+  // Derive the HMAC salt by XOR-ing the encryption salt with HMAC_SALT_MASK (0x3A).
+  // This is an arbitrary constant defined in SQLCipher to produce a distinct salt
+  // for HMAC without storing a second salt in the page header.
+  // See: https://github.com/sqlcipher/sqlcipher/blob/778ab890cfc30c3631212dcceb0295498abdcd3e/src/sqlcipher.c#L144
   unsigned char hmac_salt[SALT_SIZE];
   for (int i = 0; i < SALT_SIZE; i++)
     hmac_salt[i] = db_first_page[i] ^ 0x3A;
